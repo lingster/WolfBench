@@ -188,30 +188,29 @@ def _preflight(model: str, api_base: str, sandbox_type: str = "docker") -> None:
                 err=True,
             )
 
-    # 2. Ollama reachability — always test via local http regardless of api_base scheme/host
-    # (api_base may be an ngrok/tunnel URL; we verify Ollama itself is up on the host)
+    # 2. Server reachability — probe the OpenAI-compatible /v1/models endpoint,
+    # which both Ollama and vLLM serve, always via local http regardless of
+    # api_base scheme/host (api_base may be an ngrok/tunnel URL; we verify the
+    # server itself is up on the host)
     local_port = parsed.port or 11434
-    tags_url = f"http://127.0.0.1:{local_port}/api/tags"
+    models_url = f"http://127.0.0.1:{local_port}/v1/models"
 
     try:
-        with urllib.request.urlopen(tags_url, timeout=5) as resp:
+        with urllib.request.urlopen(models_url, timeout=5) as resp:
             data = json.loads(resp.read())
-        available = [m["name"] for m in data.get("models", [])]
-        typer.echo(f"  [OK]   Ollama reachable at {tags_url}")
+        available = [m["id"] for m in data.get("data", [])]
+        typer.echo(f"  [OK]   LLM server reachable at {models_url}")
     except Exception as e:
-        typer.echo(f"  [FAIL] Cannot reach Ollama at {tags_url}: {e}", err=True)
-        typer.echo("         Is Ollama running? Try: ollama serve", err=True)
+        typer.echo(f"  [FAIL] Cannot reach LLM server at {models_url}: {e}", err=True)
+        typer.echo("         Is it running? Try: ollama serve  (or vllm serve ...)", err=True)
         raise typer.Exit(1)
 
-    # 3. Model availability
-    # Normalise: strip tag for prefix matching (qwen3.5:122b matches qwen3.5:122b)
-    def _norm(name: str) -> str:
-        return name.split(":")[0] if ":" not in name else name
-
-    if model in available or any(a == model for a in available):
+    # 3. Model availability (Ollama ids look like 'qwen3.5:122b', vLLM ids are
+    # the model path or --served-model-name)
+    if model in available:
         typer.echo(f"  [OK]   Model '{model}' is available")
     else:
-        typer.echo(f"  [FAIL] Model '{model}' not found in Ollama. Available:", err=True)
+        typer.echo(f"  [FAIL] Model '{model}' not found on server. Available:", err=True)
         for m in available:
             typer.echo(f"           {m}", err=True)
         raise typer.Exit(1)
@@ -375,6 +374,7 @@ def _run_harbor(
     extra_env: dict[str, str],
     smoke: bool,
     run_label: str,
+    sample: bool = False,
 ) -> bool:
     """Execute one harbor run. Returns True on success."""
     global _harbor_proc
@@ -386,6 +386,8 @@ def _run_harbor(
             "-d", SMOKE_DATASET,
             "-l", "1",
         ]
+    elif sample:
+        cmd += ["-d", SMOKE_DATASET]
 
     # Write extra_env to a temp env file so Harbor forwards them into the sandbox.
     # Passing via subprocess env alone is not sufficient — Harbor passes --env-file
@@ -488,6 +490,10 @@ def main(
         "--smoke/--no-smoke",
         help="Smoke test: 1 task with short timeout (default: --smoke)",
     )] = True,
+    sample: Annotated[bool, typer.Option(
+        "--sample",
+        help="With --no-smoke: run the 10-task sample dataset instead of the full 89 tasks",
+    )] = False,
     runs: Annotated[int, typer.Option(
         "--runs", "-n",
         help="Number of full runs when --no-smoke (default: 1)",
@@ -607,7 +613,7 @@ def main(
     try:
         for i in range(1, n_runs + 1):
             label = "smoke" if smoke else f"run {i}/{n_runs}"
-            ok = _run_harbor(config_path, env_file, extra_env, smoke, label)
+            ok = _run_harbor(config_path, env_file, extra_env, smoke, label, sample)
             _report_run_errors(model_jobs_dir)
             if ok:
                 success_count += 1
