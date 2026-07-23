@@ -31,6 +31,7 @@ import argparse
 import json
 import re
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -57,9 +58,20 @@ N_SAMPLE_TASKS = len(SAMPLE_TASKS)
 _TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}__\d{2}-\d{2}-\d{2}$")
 
 
-def sample10_reward(result: dict) -> tuple[str, dict[str, float]] | None:
-    """Return (eval_name, {task_base_name: reward}) restricted to SAMPLE_TASKS,
-    or None if the run's eval doesn't cover all 10 sample tasks."""
+def sample10_reward(result: dict) -> tuple[str, dict[str, float], bool] | None:
+    """Return (eval_name, {task_base_name: reward}, is_pure_sample_run) restricted
+    to SAMPLE_TASKS, or None if the run's eval doesn't cover all 10 sample tasks.
+
+    is_pure_sample_run is False when the run is actually a full 89-task
+    terminal-bench run that happens to superset-cover the 10 sample tasks
+    (its total reward_stats coverage is 89, not 10). Full-run-derived records
+    are still useful for configs that never had a dedicated sample-10 run
+    (e.g. historic API-model runs, where this is the ONLY sample-10 data
+    point available) — but when a config ALSO has genuine 10-task
+    terminal-bench-sample runs, the full-run-derived one is a duplicate of
+    the same underlying eval and should be dropped (handled by the caller,
+    which groups by config directory).
+    """
     stats = result.get("stats", {})
     evals = stats.get("evals", {})
     eval_name = next(iter(evals), "")
@@ -67,6 +79,7 @@ def sample10_reward(result: dict) -> tuple[str, dict[str, float]] | None:
     reward = eval_data.get("reward_stats", {}).get("reward", {})
 
     task_reward: dict[str, float] = {}
+    all_tasks_seen: set[str] = set()
     for reward_str, task_list in reward.items():
         try:
             rv = float(reward_str)
@@ -74,12 +87,14 @@ def sample10_reward(result: dict) -> tuple[str, dict[str, float]] | None:
             continue
         for t in task_list:
             base = t.split("__")[0]
+            all_tasks_seen.add(base)
             if base in SAMPLE_TASKS:
                 task_reward[base] = rv
 
     if set(task_reward.keys()) != SAMPLE_TASKS:
         return None
-    return eval_name, task_reward
+    is_pure_sample_run = len(all_tasks_seen) == N_SAMPLE_TASKS
+    return eval_name, task_reward, is_pure_sample_run
 
 
 def find_runs(base_dir: Path) -> list[Path]:
@@ -115,7 +130,7 @@ def build_record(run_dir: Path, source: str) -> dict | None:
     restricted = sample10_reward(result)
     if restricted is None:
         return None
-    eval_name, task_reward = restricted
+    eval_name, task_reward, is_pure_sample_run = restricted
 
     passed_tasks = sorted(t for t, v in task_reward.items() if v == 1.0)
     failed_tasks = sorted(t for t, v in task_reward.items() if v != 1.0)
@@ -135,6 +150,9 @@ def build_record(run_dir: Path, source: str) -> dict | None:
         "n_failed": len(failed_tasks),
         "passed_tasks": passed_tasks,
         "failed_tasks": failed_tasks,
+        # Internal bookkeeping only — stripped before writing output.
+        "_is_pure_sample_run": is_pure_sample_run,
+        "_config_dir": run_dir.parent.name,
     })
     return record
 
@@ -161,12 +179,43 @@ def main():
             continue
         records.append(rec)
 
+    # Drop full-89-task-run-derived records for any config directory that
+    # ALSO has genuine 10-task terminal-bench-sample runs — otherwise the
+    # same underlying full run gets double-counted: once (correctly) in the
+    # full-89 chart, and again (spuriously) here via its 10-task subset,
+    # inflating this config's run count/average alongside its real sample
+    # runs. Configs with ONLY a full run (no dedicated sample run — e.g.
+    # some historic API-model configs) keep the full-run-derived record,
+    # since it's the only sample-10 data point available for them.
+    by_config: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        by_config[r["_config_dir"]].append(r)
+    kept_records = []
+    dropped = []
+    for config_dir, recs in by_config.items():
+        has_pure_sample = any(r["_is_pure_sample_run"] for r in recs)
+        for r in recs:
+            if has_pure_sample and not r["_is_pure_sample_run"]:
+                dropped.append(r["run_dir"])
+                continue
+            kept_records.append(r)
+    records = kept_records
+
+    # Strip internal bookkeeping fields before emitting the chart-schema output.
+    for r in records:
+        r.pop("_is_pure_sample_run", None)
+        r.pop("_config_dir", None)
+
     records.sort(key=lambda r: r.get("timestamp", ""))
 
     print(f"Scanned {len(all_run_dirs)} run dirs "
           f"({len(find_runs(REPO_RUNS_DIR))} in {REPO_RUNS_DIR}, "
           f"{len(find_runs(LOCAL_RUNS_DIR))} in {LOCAL_RUNS_DIR})", file=sys.stderr)
     print(f"Included {len(records)} runs covering all 10 sample tasks", file=sys.stderr)
+    print(f"Dropped {len(dropped)} full-89-run-derived records "
+          f"(config already has genuine sample-10 runs):", file=sys.stderr)
+    for s in dropped:
+        print(f"  dropped: {s}", file=sys.stderr)
     print(f"Skipped {len(skipped)} runs (partial sample-task coverage):", file=sys.stderr)
     for s in skipped:
         print(f"  skipped: {s}", file=sys.stderr)
